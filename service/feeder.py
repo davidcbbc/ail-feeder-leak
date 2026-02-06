@@ -15,7 +15,10 @@ from threading import Event
 from typing import Iterable, Iterator
 
 
-from service.utils import get_list_of_files
+try:
+    from service.utils import get_list_of_files
+except ModuleNotFoundError:
+    from .utils import get_list_of_files
 
 CURRENT_LEAK_FILENAME = "current_leak.txt"
 MANIFEST_FILENAME = "fs_manifest.csv"
