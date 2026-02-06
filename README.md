@@ -26,6 +26,12 @@ AIL LeakFeeder is a helper module for the AIL Framework that automates ingesting
 pip3 install -U -r requirements.txt
 ```
 
+If you are using a very new Python release (e.g., 3.13), make sure your packaging tools are up to date:
+
+```bash
+pip3 install -U pip setuptools wheel
+```
+
 ## Configuration
 
 The feeder uses `config.yaml` by default, and every value can be overridden via CLI flags or environment variables (see below). A minimal example:
