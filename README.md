@@ -53,9 +53,9 @@ wait: 0.5
 ### Configuration options
 
 - `name`: Feeder source name reported to AIL.
-- `leaks_folder`: Folder containing new leak files to ingest.
-- `out_folder`: Folder used for split files and their manifest.
-- `unprocessed_folder`: Folder used for unprocessed directories.
+- `leaks_folder`: Folder containing new leak files to ingest (relative to repo root unless absolute).
+- `out_folder`: Folder used for split files and their manifest (relative to repo root unless absolute).
+- `unprocessed_folder`: Folder used for unprocessed directories (relative to repo root unless absolute).
 - `chunks`: Maximum chunk size in bytes.
 - `api_key`: AIL API key with import permissions.
 - `ail_url`: Base URL for the AIL API (e.g., `https://ail.example.org`).

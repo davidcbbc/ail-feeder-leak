@@ -39,6 +39,11 @@ class LeakFeeder:
     def __init__(self, config: FeederConfig) -> None:
         self.config = config
         self.start_time = time.time()
+        self.base_dir = Path(__file__).resolve().parent.parent
+
+    def _resolve_path(self, path_value: str) -> Path:
+        candidate = Path(path_value)
+        return candidate if candidate.is_absolute() else self.base_dir / candidate
 
     def _wait(self) -> None:
         Event().wait(self.config.wait)
@@ -175,13 +180,15 @@ class LeakFeeder:
         self.run()
 
     def _update_leak_list(self) -> bool:
-        dirname = Path(os.path.realpath(__file__))
-        cur_dir = dirname.resolve().parent / self.config.leaks_folder
-        unprocessed_folder = dirname.resolve().parent / self.config.out_folder
+        cur_dir = self._resolve_path(self.config.leaks_folder)
+        unprocessed_folder = self._resolve_path(self.config.out_folder)
+
+        if not cur_dir.exists():
+            print(f"Leaks folder does not exist: {cur_dir}")
+            return False
 
         if not list(cur_dir.iterdir()):
-            cur_dir = Path(os.path.realpath(__file__)).parent
-            manifest_file = cur_dir / self.config.out_folder / MANIFEST_FILENAME
+            manifest_file = unprocessed_folder / MANIFEST_FILENAME
             if manifest_file.exists():
                 rows = list(read_manifest(manifest_file))
                 return bool(rows)
@@ -202,36 +209,34 @@ class LeakFeeder:
 
     def _move_new_leak(self) -> bool:
         if self._update_leak_list():
-            cur_dir = Path(os.path.realpath(__file__)).parent
-            leak_list = cur_dir / LEAK_LIST_FILENAME
+            leak_list = self.base_dir / LEAK_LIST_FILENAME
             with leak_list.open(encoding="utf-8") as leak_file:
                 reader = csv.DictReader(leak_file)
                 first_row = next(reader, None)
             if not first_row:
                 return False
             file_name = first_row["Leaks"]
-            leak_source_path = cur_dir / self.config.leaks_folder / file_name
-            leak_destination_path = cur_dir / self.config.out_folder
+            leak_source_path = self._resolve_path(self.config.leaks_folder) / file_name
+            leak_destination_path = self._resolve_path(self.config.out_folder)
             if leak_source_path.exists():
                 new_location = shutil.move(str(leak_source_path), str(leak_destination_path))
-                with open(CURRENT_LEAK_FILENAME, "w", encoding="utf-8") as file:
+                with open(self.base_dir / CURRENT_LEAK_FILENAME, "w", encoding="utf-8") as file:
                     file.write(new_location)
                 return True
         return False
 
     def run(self) -> None:
-        leaks_folder = Path(self.config.leaks_folder)
-        unprocessed_leaks = Path(self.config.out_folder)
-        unprocessed_folder = Path(self.config.unprocessed_folder)
-        cur_dir = Path(os.path.realpath(__file__)).parent
-        manifest_file = cur_dir / unprocessed_leaks / MANIFEST_FILENAME
+        leaks_folder = self._resolve_path(self.config.leaks_folder)
+        unprocessed_leaks = self._resolve_path(self.config.out_folder)
+        unprocessed_folder = self._resolve_path(self.config.unprocessed_folder)
+        manifest_file = unprocessed_leaks / MANIFEST_FILENAME
 
         leaks_folder.mkdir(exist_ok=True)
         unprocessed_leaks.mkdir(exist_ok=True)
         unprocessed_folder.mkdir(exist_ok=True)
 
         if self._update_leak_list():
-            current_leak_path = cur_dir / CURRENT_LEAK_FILENAME
+            current_leak_path = self.base_dir / CURRENT_LEAK_FILENAME
             if not current_leak_path.exists():
                 print("Starting a new process")
                 self._move_new_leak()
@@ -241,7 +246,7 @@ class LeakFeeder:
                 if manifest_file.exists():
                     if not list(read_manifest(manifest_file)):
                         print("Cleaning from the last task")
-                        folder_cleaner(cur_dir / unprocessed_leaks)
+                        folder_cleaner(unprocessed_leaks)
                         self.run()
                     else:
                         print("Processing from the last task")
@@ -255,7 +260,7 @@ class LeakFeeder:
                     else:
                         if current_leak_path.exists():
                             current_leak_path.unlink()
-                        leak_list_txt = cur_dir / "leak_list.txt"
+                        leak_list_txt = self.base_dir / "leak_list.txt"
                         if leak_list_txt.exists():
                             leak_list_txt.unlink()
                         print("No more leaks to process")
