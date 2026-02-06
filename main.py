@@ -19,7 +19,7 @@ import configargparse
 import pandas as pd
 import requests
 import simplejson as json
-from fsplit.filesplit import Filesplit
+from filesplit.filesplit import Filesplit
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 ##################################
