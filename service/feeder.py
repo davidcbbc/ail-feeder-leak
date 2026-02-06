@@ -67,6 +67,7 @@ class LeakFeeder:
             data = response.json()
             if "status" in response.text:
                 if data.get("status") == "pong":
+                    print("AIL API check succeeded.")
                     return True
                 if data.get("status") == "error":
                     return data.get("reason", "unknown error")
@@ -139,6 +140,7 @@ class LeakFeeder:
             output = self._prepare_payload(leak_name, file_name, file_sha256, file_content)
             self._wait()
             return self._publish(manifest_file, file_name, data=json_dumps(output))
+        print(f"AIL API check failed: {check_resp}")
         return check_resp
 
     def _split_file(self, leak_path: Path) -> None:
@@ -178,7 +180,10 @@ class LeakFeeder:
                 file_lines = file_reader.readlines()
             with file_content_path.open("rb") as file_reader:
                 file_sha256 = hashlib.sha256(file_reader.read(file_size)).hexdigest()
-            self._send_to_ail(leak_name, file_name, file_sha256, file_lines, manifest_file)
+            send_result = self._send_to_ail(leak_name, file_name, file_sha256, file_lines, manifest_file)
+            if send_result is not True:
+                print("Stopping processing because AIL API check failed.")
+                return
             self._wait()
         self.run()
 
