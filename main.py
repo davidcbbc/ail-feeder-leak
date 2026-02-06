@@ -9,10 +9,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from service.feeder import FeederConfig, LeakFeeder
+import service.feeder as feeder_module
 
 
-def build_config() -> FeederConfig:
+def build_config() -> feeder_module.FeederConfig:
     args_parser = configargparse.ArgParser(default_config_files=["config.yaml"])
     args_parser.add("-g", "--config", is_config_file=True, help="Configuration file path.")
     args_parser.add("-n", "--name", required=True, help="Name of the feeder.")
@@ -33,7 +33,7 @@ def build_config() -> FeederConfig:
     args_parser.add("-w", "--wait", type=float, default=0.0, help="Time sleep between API calls in seconds.")
 
     options = args_parser.parse_args()
-    return FeederConfig(
+    return feeder_module.FeederConfig(
         name=options.name,
         leaks_folder=options.leaks_folder,
         out_folder=options.out_folder,
@@ -48,7 +48,7 @@ def build_config() -> FeederConfig:
 
 def main() -> None:
     config = build_config()
-    feeder = LeakFeeder(config)
+    feeder = feeder_module.LeakFeeder(config)
     feeder.run()
 
 
