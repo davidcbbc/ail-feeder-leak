@@ -29,7 +29,7 @@ pip3 install -U -r requirements.txt
 If you are using a very new Python release (e.g., 3.13), make sure your packaging tools are up to date:
 
 ```bash
-pip3 install -U pip setuptools wheel
+python3 -m pip install -U pip
 ```
 
 ## Configuration
@@ -117,10 +117,10 @@ pytest -q
 - **Import errors for `magic`**: ensure the `libmagic` system package is installed.
 - **SSL verification warnings**: the feeder disables certificate verification by default (matching prior behavior). Consider adding a trusted certificate or reverse proxy in production.
 - **No files processed**: verify `Leaks_Folder` exists and contains text files, and ensure `chunks` is > 0.
-- **`BackendUnavailable: Cannot import 'setuptools.build_meta'` on Python 3.13**: upgrade your packaging tools and retry. If it persists, disable build isolation so pip uses your upgraded setuptools:
+- **`BackendUnavailable: Cannot import 'setuptools.build_meta'` on Python 3.13**: upgrade your packaging tools and retry. If it persists, install setuptools explicitly (outside the requirements) and disable build isolation so pip uses it:
 
 ```bash
-python3 -m pip install -U pip setuptools wheel
+python3 -m pip install -U pip setuptools
 PIP_NO_BUILD_ISOLATION=1 pip3 install -U -r requirements.txt
 ```
 
