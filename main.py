@@ -1,331 +1,325 @@
-##################################
-# Import External packages
-##################################
+"""AIL LeakFeeder - modernized implementation."""
+from __future__ import annotations
+
+import argparse
 import base64
 import csv
-import datetime
 import gzip
 import hashlib
+import json
+import logging
 import os
-import re
 import shutil
 import sys
-import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
+from typing import Dict, Iterable, Optional
 
-import configargparse
-import pandas as pd
 import requests
-import simplejson as json
-from fsplit.filesplit import Filesplit
+import yaml
+from filesplit.filesplit import Filesplit
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-##################################
-# Import Project packages
-##################################
 from service.utils import get_list_of_files
 
-start_time = time.time()
+CURRENT_LEAK_FILENAME = "current_leak.txt"
+MANIFEST_FILENAME = "fs_manifest.csv"
+LEAK_LIST_FILENAME = "leak_list.csv"
 
-sys.setrecursionlimit(10 ** 7)  # max depth of recursion
-threading.stack_size(2 ** 27)  # new thread will get stack of such size
+LOG = logging.getLogger("ail_leakfeeder")
 
-# Feeder configuration dict
-CONFIG = None
 
-current_leak_filename = "current_leak.txt"
-manifest_filename = "fs_manifest.csv"
-leak_list_filename = "leak_list.csv"
+@dataclass
+class FeederConfig:
+    name: str = "LeakFeeder"
+    leaks_folder: str = "Leaks_Folder"
+    out_folder: str = "Unprocessed_Leaks"
+    unprocessed_folder: str = "Unprocessed_files"
+    chunks: int = 100000
+    api_key: str = ""
+    ail_url: str = ""
+    uuid: str = ""
+    wait: float = 1.0
 
-def ail_publish(apikey, manifest_file, file_name, data=None):
-    """
-    publish the chunked file to ail and remove it from folder and manifest
-    """
+    def to_paths(self, base_dir: Path) -> Dict[str, Path]:
+        return {
+            "leaks": base_dir / self.leaks_folder,
+            "out": base_dir / self.out_folder,
+            "unprocessed": base_dir / self.unprocessed_folder,
+        }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="AIL LeakFeeder")
+    parser.add_argument("-g", "--config", default="config.yaml", help="Configuration file path.")
+    parser.add_argument("-n", "--name", help="Name of the feeder.")
+    parser.add_argument("-l", "--leaks_folder", help="Leaks Folder to parse and send to AIL.")
+    parser.add_argument("-r", "--out_folder", help="Output Folder of unprocessed split files.")
+    parser.add_argument("-a", "--unprocessed_folder", help="Output Folder of file that cannot be processed.")
+    parser.add_argument("-c", "--chunks", type=int, help="Chunk size of split files.")
+    parser.add_argument("-k", "--api_key", help="API key for AIL authentication.")
+    parser.add_argument("-u", "--ail_url", help="AIL API URL.")
+    parser.add_argument("-i", "--uuid", help="Unique identifier of the feeder.")
+    parser.add_argument("-w", "--wait", type=float, help="Time sleep between API calls in seconds.")
+    return parser.parse_args()
+
+
+def load_config(args: argparse.Namespace) -> FeederConfig:
+    config = FeederConfig()
+    config_path = Path(args.config)
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        for key, value in data.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+
+    for field_name in config.__dataclass_fields__:
+        override = getattr(args, field_name, None)
+        if override is not None:
+            setattr(config, field_name, override)
+
+    return config
+
+
+def request_sleep(wait: float) -> None:
+    if wait > 0:
+        time.sleep(wait)
+
+
+def check_ail(config: FeederConfig) -> Optional[str]:
     try:
-        ail_url = f"{CONFIG.ail_url}/import/json/item"
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-        ail_response = requests.post(ail_url, headers={'Content-Type': 'application/json', 'Authorization': apikey},
-                                     data=data, verify=False)
-        data = ail_response.json()
-        Event().wait(CONFIG.wait)
-        if "status" in ail_response.text:
-            if data.get("status") == "success":
-                print(file_name + ": Successfully Pushed to Ail")
-                file_by_number = re.findall(r"[-+]?\d*\.\d+|\d+", file_name.split('_')[1])
-                file_to_del = file_name.split('_')[0] + "_" + str(int(file_by_number[0]) - 1)
-                filepath = os.path.join(os.path.dirname(os.path.realpath(manifest_file)), file_to_del)
-                if os.path.exists(filepath):
-                    os.unlink(os.path.join(os.path.dirname(os.path.realpath(manifest_file)), file_to_del))
-                remove_split_manifest(manifest_file, "filename", file_name)
-                return True
-            if data.get("status") == "error":
-                print(data.get("reason"))
-    except Exception as e:
-        print(e)
+        response = requests.get(
+            f"{config.ail_url}/ping",
+            headers={"Content-Type": "application/json", "Authorization": config.api_key},
+            verify=False,
+            timeout=30,
+        )
+        data = response.json()
+        if data.get("status") == "pong":
+            return None
+        return data.get("reason", "AIL ping failed")
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
 
 
-def check_ail(apikey):
-    """
-    check if AIL instance is available
-    """
+def publish_to_ail(config: FeederConfig, payload: dict) -> Optional[str]:
     try:
-        ail_ping = f"{CONFIG.ail_url}/ping"
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-        ail_response = requests.get(ail_ping, headers={'Content-Type': 'application/json', 'Authorization': apikey},
-                                    verify=False)
-        data = ail_response.json()
-        if "status" in ail_response.text:
-            if data.get("status") == "pong":
-                return True
-            if data.get("status") == "error":
-                return data.get("reason")
-    except Exception as e:
-        print(e)
+        response = requests.post(
+            f"{config.ail_url}/import/json/item",
+            headers={"Content-Type": "application/json", "Authorization": config.api_key},
+            data=json.dumps(payload, indent=2, sort_keys=True, default=str),
+            verify=False,
+            timeout=60,
+        )
+        data = response.json()
+        if data.get("status") == "success":
+            return None
+        return data.get("reason", "AIL publish failed")
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
 
 
-def json_clean(o):
-    if isinstance(o, datetime.datetime):
-        return o.__str__()
-
-
-def ail(leak_name, file_name, file_sha256, file_content, manifest_file):
-    """
-    prepare the data before sending them to AIL API
-    """
-    ail_feeder_type = CONFIG.name
-    uuid = CONFIG.uuid
-    ail_api = CONFIG.api_key
-    print("Checking AIL API...")
-    check_ail_resp = check_ail(ail_api)
-    if check_ail_resp:
-        print(f"Starting to process content of: {file_name}")
-        print(f"The sha256 of {file_name} content is : {file_sha256}")
-        li2str = ''.join(str(e) for e in file_content)
-        comp_b64 = base64.b64encode(gzip.compress(li2str.encode('utf-8'))).decode()
-        output = {}
-        output['source'] = ail_feeder_type
-        output['source-uuid'] = uuid
-        output['default-encoding'] = 'UTF-8'
-        output['meta'] = {}
-        output['meta']['Leaked:FileName'] = os.path.basename(leak_name)
-        output['meta']['Leaked:Chunked'] = file_name
-        output['data-sha256'] = file_sha256
-        output['data'] = comp_b64
-        Event().wait(CONFIG.wait)
-        ail_pub_res = ail_publish(ail_api, manifest_file, file_name,
-                                  data=json.dumps(output, indent=4, sort_keys=True, default=str))
-        if not ail_pub_res:
-            return ail_pub_res
-    else:
-        return check_ail_resp
-
-
-def split(leak_name, chunk_size):
-    """
-    will split the leak into chunks of files based on the config file
-    """
-    dir_path = os.path.dirname(os.path.realpath(leak_name))
-    manifest_file = os.path.join(dir_path, manifest_filename)
-    if os.path.exists(manifest_file):
-        print("Resuming from the last task")
-        file_worker(leak_name, dir_path)
-    else:
-        print("Splitting the file now")
-        Filesplit().split(file=leak_name, split_size=chunk_size, output_dir=dir_path, newline=True)
-        print("File split successfully")
-        file_worker(leak_name, dir_path)
-
-
-def remove_split_manifest(file, column_name, *args):
-    """
-    remove a specific raw from the manifest file
-    """
-    row_to_remove = []
-    for row_name in args:
-        row_to_remove.append(row_name)
+def remove_manifest_row(manifest_file: Path, filename: str) -> None:
     try:
-        df = pd.read_csv(file)
-        for row in row_to_remove:
-            df = df[eval("df.{}".format(column_name)) != row]
-        df.to_csv(file, index=False)
-    except Exception as e:
-        print(e)
+        if not manifest_file.exists():
+            return
+        with manifest_file.open("r", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        rows = [row for row in rows if row.get("filename") != filename]
+        with manifest_file.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["filename", "filesize"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("Failed to update manifest %s: %s", manifest_file, exc)
 
 
-def file_worker(leak_name, dir_path):
-    """
-    will iterate based on the manifest file line by line and prepare them as a
-    list and send them to Ail function
-    :param leak_name: input of the file
-    :param dir_path: where to process the files
-    """
-    print("Starting to process splits")
-    manifest_file = os.path.join(dir_path, manifest_filename)
-    if not os.path.isdir(dir_path):
-        print("Input directory is not a valid directory")
-
-    if not os.path.exists(manifest_file):
-        print("Unable to locate manifest file")
-
-    print("Processing data from splits")
-    with open(file=manifest_file, mode="r", encoding="utf-8") as reader:
-        manifest_reader = csv.DictReader(f=reader)
-        for manifest_files in manifest_reader:
-            file_name = manifest_files.get("filename")
-            file_content = os.path.join(dir_path, manifest_files.get("filename"))
-            file_size = int(manifest_files.get("filesize"))
-            # TODO add a try: except UnicodeDecodeError: to bypass binary files
-            with open(file_content, encoding="utf8", errors='ignore') as f:
-                Event().wait(CONFIG.wait)
-                file_lines = f.readlines()
-                with open(file_content, "rb") as f:
-                    file_sha256 = hashlib.sha256(f.read(file_size)).hexdigest()
-                ail(leak_name, file_name, file_sha256, file_lines, manifest_file)
-                Event().wait(CONFIG.wait)
-    run()
+def iter_manifest(manifest_file: Path) -> Iterable[dict]:
+    with manifest_file.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if row.get("filename"):
+                yield row
 
 
-def folder_cleaner(path):
-    """
-    Will clean all folders and files in given path
-    """
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            os.unlink(os.path.join(root, f))
-        for d in dirs:
-            shutil.rmtree(os.path.join(root, d))
+def split_leak(leak_path: Path, chunk_size: int) -> None:
+    LOG.info("Splitting leak: %s", leak_path)
+    Filesplit().split(file=str(leak_path), split_size=chunk_size, output_dir=str(leak_path.parent), newline=True)
 
 
-def update_leak_list():
-    """
-    it will update and save the list of leaks inside
-    Leaks_Folder dir and return bool, checks for the last task
-    :rtype: bool
-    """
-    dirname = Path(os.path.realpath(__file__))
-    cur_dir = os.path.join(dirname.resolve().parent, CONFIG.leaks_folder)
-    unprocessed_folder = os.path.join(dirname.resolve().parent, CONFIG.out_folder)
+def prepare_payload(config: FeederConfig, leak_name: str, file_name: str, file_sha256: str, content: str) -> dict:
+    compressed = base64.b64encode(gzip.compress(content.encode("utf-8"))).decode()
+    return {
+        "source": config.name,
+        "source-uuid": config.uuid,
+        "default-encoding": "UTF-8",
+        "meta": {
+            "Leaked:FileName": os.path.basename(leak_name),
+            "Leaked:Chunked": file_name,
+        },
+        "data-sha256": file_sha256,
+        "data": compressed,
+    }
 
-    if not os.listdir(cur_dir):
-        cur_dir = os.path.dirname(os.path.realpath(__file__))
-        manifest_file = os.path.join(cur_dir, CONFIG.out_folder, manifest_filename)
-        if os.path.exists(manifest_file):
-            df = pd.read_csv(manifest_file)
-            if df.empty:
-                return False
-            else:
-                return True
 
-    list_of_files = get_list_of_files(cur_dir, unprocessed_folder)
-    print(f"list_of_files: {list_of_files}")
+def process_manifest(config: FeederConfig, leak_path: Path) -> bool:
+    manifest_file = leak_path.parent / MANIFEST_FILENAME
+    if not manifest_file.exists():
+        LOG.error("Manifest file missing: %s", manifest_file)
+        return False
 
-    df = pd.DataFrame(list_of_files, columns=["Leaks"])
-    df.to_csv(leak_list_filename, index=False)
+    ail_error = check_ail(config)
+    if ail_error:
+        LOG.error("AIL ping failed: %s", ail_error)
+        return False
+
+    for row in iter_manifest(manifest_file):
+        file_name = row["filename"]
+        file_size = int(row.get("filesize", 0))
+        chunk_path = leak_path.parent / file_name
+        if not chunk_path.exists():
+            LOG.warning("Missing chunk file: %s", chunk_path)
+            remove_manifest_row(manifest_file, file_name)
+            continue
+
+        LOG.info("Processing chunk: %s", file_name)
+        request_sleep(config.wait)
+        with chunk_path.open("rb") as handle:
+            data = handle.read(file_size)
+        file_sha256 = hashlib.sha256(data).hexdigest()
+        text_content = data.decode("utf-8", errors="ignore")
+        payload = prepare_payload(config, str(leak_path), file_name, file_sha256, text_content)
+
+        publish_error = publish_to_ail(config, payload)
+        if publish_error:
+            LOG.error("Failed to publish %s: %s", file_name, publish_error)
+            return False
+
+        LOG.info("Published %s", file_name)
+        request_sleep(config.wait)
+        remove_manifest_row(manifest_file, file_name)
+        chunk_path.unlink(missing_ok=True)
+
     return True
 
 
-def end_time():
-    """
-    will indicate the runtime in seconds when the module finishes
-    """
-    run_time = (time.time() - start_time)
-    print(f"Run time(s): {run_time}")
+def cleanup_leak(out_dir: Path) -> None:
+    if not out_dir.exists():
+        return
+    for entry in out_dir.iterdir():
+        if entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            shutil.rmtree(entry)
 
 
-def move_new_leak():
-    """
-    this function will move a new leak for work
-     if Unprocessed_Leaks is empty else it will continue the previous work
-    :rtype: bool
-    """
-    result = False
-
-    if update_leak_list():
-        cur_dir = os.path.dirname(os.path.realpath(__file__))
-        leak_list = os.path.join(cur_dir, leak_list_filename)
-        file_name = ((pd.read_csv(leak_list).values[0]).tolist())[0]
-        leak_source_path = os.path.join(cur_dir, CONFIG.leaks_folder, file_name)
-        leak_destination_path = os.path.join(cur_dir, CONFIG.out_folder)
-        if os.path.exists(leak_source_path):
-            new_location = shutil.move(leak_source_path, leak_destination_path)
-            with open(current_leak_filename, "w") as file:
-                file.write(new_location)
-                file.close()
-            result = True
-    
-    return result
+def write_current_leak(leak_path: Path) -> None:
+    Path(CURRENT_LEAK_FILENAME).write_text(str(leak_path), encoding="utf-8")
 
 
-def run():
-    """
-    Run the feeder
-    """
-    leaks_folder = CONFIG.leaks_folder
-    unprocessed_leaks = CONFIG.out_folder
-    unprocessed_folder = CONFIG.unprocessed_folder
-    cur_dir = os.path.dirname(os.path.realpath(__file__))
-    manifest_file = os.path.join(cur_dir, unprocessed_leaks, manifest_filename)
-    chunk_size = CONFIG.chunks
-    if not os.path.isdir(leaks_folder):
-        os.makedirs(leaks_folder)
+def read_current_leak() -> Optional[Path]:
+    current = Path(CURRENT_LEAK_FILENAME)
+    if current.exists():
+        return Path(current.read_text(encoding="utf-8").strip())
+    return None
 
-    if not os.path.isdir(unprocessed_leaks):
-        os.makedirs(unprocessed_leaks)
 
-    if not os.path.isdir(unprocessed_folder):
-        os.makedirs(unprocessed_folder)
+def remove_current_leak_marker() -> None:
+    marker = Path(CURRENT_LEAK_FILENAME)
+    if marker.exists():
+        marker.unlink()
 
-    if update_leak_list():
-        if not os.path.exists(os.path.join(cur_dir, current_leak_filename)):
-            print("Starting a new process")
-            move_new_leak()
-            leak_name = open(current_leak_filename, "r+").read()
-            split(leak_name, chunk_size)
-        else:
-            if os.path.exists(manifest_file):
-                df = pd.read_csv(manifest_file)
-                if df.empty:
-                    print("Cleaning from the last task")
-                    folder_cleaner(os.path.join(cur_dir, unprocessed_leaks))
-                    run()
-                else:
-                    print("Processing from the last task")
-                    leak_name = open(current_leak_filename, "r+").read()
-                    split(leak_name, chunk_size)
-            else:
-                if move_new_leak():
-                    print("Processing new task")
-                    leak_name = open(current_leak_filename, "r+").read()
-                    split(leak_name, chunk_size)
-                else:
-                    if os.path.exists(os.path.join(cur_dir, current_leak_filename)):
-                        os.remove(os.path.join(cur_dir, current_leak_filename))
-                    if os.path.exists(os.path.join(cur_dir, "leak_list.txt")):
-                        os.remove(os.path.join(cur_dir, "leak_list.txt"))
-                    print("No more leaks to process")
-                    end_time()
-    else:
-        print("Leaks folder is empty !")
-        end_time()
+
+def update_leak_list(leaks_dir: Path, unprocessed_dir: Path) -> bool:
+    if not leaks_dir.exists():
+        leaks_dir.mkdir(parents=True, exist_ok=True)
+
+    list_of_files = get_list_of_files(str(leaks_dir), str(unprocessed_dir))
+    if not list_of_files:
+        return False
+
+    with Path(LEAK_LIST_FILENAME).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Leaks"])
+        for leak in list_of_files:
+            writer.writerow([leak])
+    return True
+
+
+def move_next_leak(leaks_dir: Path, out_dir: Path, unprocessed_dir: Path) -> Optional[Path]:
+    if not update_leak_list(leaks_dir, unprocessed_dir):
+        return None
+
+    leak_list = Path(LEAK_LIST_FILENAME)
+    with leak_list.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        first = next(reader, None)
+    if not first:
+        return None
+
+    source = leaks_dir / first["Leaks"]
+    if not source.exists():
+        return None
+
+    destination = out_dir / source.name
+    moved = shutil.move(str(source), str(destination))
+    leak_path = Path(moved)
+    write_current_leak(leak_path)
+    return leak_path
+
+
+def process_leaks(config: FeederConfig) -> None:
+    base_dir = Path(__file__).resolve().parent
+    paths = config.to_paths(base_dir)
+
+    for directory in paths.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        current_leak = read_current_leak()
+        if current_leak is None:
+            current_leak = move_next_leak(paths["leaks"], paths["out"], paths["unprocessed"])
+            if current_leak is None:
+                LOG.info("No more leaks to process.")
+                break
+
+        manifest_file = current_leak.parent / MANIFEST_FILENAME
+        if not manifest_file.exists():
+            split_leak(current_leak, config.chunks)
+
+        if process_manifest(config, current_leak):
+            cleanup_leak(paths["out"])
+            remove_current_leak_marker()
+            continue
+
+        LOG.warning("Stopping due to processing error. Resolve and rerun to resume.")
+        break
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def main() -> int:
+    configure_logging()
+    args = parse_args()
+    config = load_config(args)
+
+    if not config.ail_url or not config.api_key:
+        LOG.error("AIL URL and API key must be provided via config or CLI.")
+        return 2
+
+    process_leaks(config)
+    return 0
 
 
 if __name__ == "__main__":
-    args_parser = configargparse.ArgParser(default_config_files=['config.yaml'])
-    args_parser.add('-g', '--config', is_config_file=True, help='Configuration file path.')
-    args_parser.add('-n', '--name', help='Name of the feeder.')
-    args_parser.add('-l', '--leaks_folder', help='Leaks Folder to parse and send to AIL.')
-    args_parser.add('-r', '--out_folder', help='Output Folder of unprocessed split files.')
-    args_parser.add('-a', '--unprocessed_folder', help='Output Folder of file that cannot be processed.')
-    args_parser.add('-c', '--chunks', type=int, required=True, env_var='FEEDER_LEAKS_CHUNKS',
-                    help='Chunks size of split files.')
-    args_parser.add('-k', '--api_key', help="API key for AIL authentication.")
-    args_parser.add('-u', '--ail_url', help='AIL API URL.')
-    args_parser.add('-i', '--uuid', help='Uniq identifier of the feeder.')
-    args_parser.add('-w', '--wait', type=float, help='Time sleep between API calls in seconds.')
-
-    options = args_parser.parse_args()
-    CONFIG = options
-
-    run()
+    sys.exit(main())
