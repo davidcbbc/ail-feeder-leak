@@ -32,6 +32,8 @@ If you are using a very new Python release (e.g., 3.13), make sure your packagin
 python3 -m pip install -U pip
 ```
 
+If `pip3 install -r requirements.txt` is still trying to install old pins like `numpy==1.21.1`, you are using a stale requirements file. Pull the latest version of this repository and re-open `requirements.txt` to confirm it only contains the modern dependencies listed in this README.
+
 ## Configuration
 
 The feeder uses `config.yaml` by default, and every value can be overridden via CLI flags or environment variables (see below). A minimal example:
